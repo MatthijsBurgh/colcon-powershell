@@ -4,6 +4,7 @@
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 from colcon_core.environment_variable import EnvironmentVariable
@@ -15,7 +16,6 @@ from colcon_core.shell import get_environment_variables
 from colcon_core.shell import logger
 from colcon_core.shell import ShellExtensionPoint
 from colcon_core.shell.template import expand_template
-import psutil
 
 """Environment variable to override the CMake executable"""
 POWERSHELL_COMMAND_ENVIRONMENT_VARIABLE = EnvironmentVariable(
@@ -45,18 +45,50 @@ POWERSHELL_EXECUTABLE = which_executable(
     POWERSHELL_COMMAND_ENVIRONMENT_VARIABLE.name, powershell_executable_name)
 
 
-def parent_process_is_powershell():
-    """Determine if the parent process is PowerShell.
-
-    In case the executable name is not found,
-    it is assumed that the parent process is not PowerShell.
+def get_parent_process_name():
     """
-    parent = psutil.Process().parent()
-    if parent is None:
-        return False
+    Determine the name of the parent process.
 
-    parent_name = parent.name()
-    return parent_name == powershell_executable_name
+    Only supported on non-Windows platforms.
+
+    :returns: The name of the parent process, or None if it can't be
+      determined
+    :rtype: str
+    """
+    ppid = os.getppid()
+    try:
+        if sys.platform.startswith('linux'):
+            with open('/proc/{ppid}/comm'.format(ppid=ppid)) as h:
+                name = h.read()
+        else:
+            name = subprocess.check_output(
+                ['ps', '-o', 'comm=', '-p', str(ppid)],
+                stderr=subprocess.DEVNULL, universal_newlines=True)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    # login shells are prefixed with a dash, macOS reports the full path
+    name = os.path.basename(name.strip().lstrip('-'))
+    return name or None
+
+
+def parent_process_is_powershell():
+    """
+    Determine if the parent process is PowerShell.
+
+    If the name of the parent process can't be determined, fall back to
+    checking if the PowerShell specific `PSModulePath` environment variable
+    is set.
+
+    :rtype: bool
+    """
+    parent_name = get_parent_process_name()
+    if parent_name is None:
+        return bool(os.environ.get('PSModulePath'))
+
+    powershell_names = {powershell_executable_name}
+    if POWERSHELL_EXECUTABLE:
+        powershell_names.add(os.path.basename(POWERSHELL_EXECUTABLE))
+    return parent_name in powershell_names
 
 
 class PowerShellExtension(ShellExtensionPoint):
@@ -77,14 +109,13 @@ class PowerShellExtension(ShellExtensionPoint):
         satisfies_version(ShellExtensionPoint.EXTENSION_POINT_VERSION, '^2.2')
 
         # HACK heuristics to determine if the parent shell is PowerShell
-        if sys.platform == 'win32':
+        if not POWERSHELL_EXECUTABLE:
+            self._is_primary = False
+        elif sys.platform == 'win32':
             pathexts = os.environ.get('PATHEXT', '').lower().split(os.pathsep)
             self._is_primary = '.cpl' in pathexts
         else:
             self._is_primary = parent_process_is_powershell()
-
-        if not POWERSHELL_EXECUTABLE:
-            self._is_primary = False
 
     def get_file_extensions(self):  # noqa: D102
         return ('ps1', )
